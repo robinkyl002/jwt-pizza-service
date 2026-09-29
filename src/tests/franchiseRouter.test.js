@@ -4,6 +4,7 @@ const app = require('../service');
 const uniqueName = () => Math.random().toString(36).substring(2, 12);
 
 let adminAuthToken;
+let nonAdminAuthToken;
 let franchiseAdmin;
 let createdFranchiseId;
 
@@ -23,6 +24,7 @@ beforeAll(async () => {
       password: 'password',
     });
   franchiseAdmin = registerRes.body.user;
+  nonAdminAuthToken = registerRes.body.token;
 });
 
 afterAll(async () => {
@@ -57,5 +59,20 @@ test('an admin can create a franchise', async () => {
         email: franchiseAdmin.email,
       },
     ],
+  });
+});
+
+test('a non-admin cannot create a franchise', async () => {
+  const createRes = await request(app)
+    .post('/api/franchise')
+    .set('Authorization', `Bearer ${nonAdminAuthToken}`)
+    .send({
+      name: `test-franchise-${uniqueName()}`,
+      admins: [{ email: franchiseAdmin.email }],
+    });
+
+  expect(createRes.status).toBe(403);
+  expect(createRes.body).toMatchObject({
+    message: 'unable to create a franchise',
   });
 });
