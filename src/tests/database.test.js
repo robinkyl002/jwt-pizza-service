@@ -40,6 +40,46 @@ async function cleanUpUser(userId) {
   });
 }
 
+async function cleanUpOrder(orderId) {
+  await withConnection(async (connection) => {
+    await DB.query(connection, 'DELETE FROM orderItem WHERE orderId=?', [orderId]);
+    await DB.query(connection, 'DELETE FROM dinerOrder WHERE id=?', [orderId]);
+  });
+}
+
+async function cleanUpFranchise(franchiseId) {
+  await withConnection(async (connection) => {
+    await DB.query(connection, 'DELETE FROM store WHERE franchiseId=?', [franchiseId]);
+    await DB.query(connection, 'DELETE FROM userRole WHERE objectId=? AND role=?', [franchiseId, Role.Franchisee]);
+    await DB.query(connection, 'DELETE FROM franchise WHERE id=?', [franchiseId]);
+  });
+}
+
+async function createFranchise(admin) {
+  return DB.createFranchise({
+    name: `test-franchise-${uniqueValue()}`,
+    admins: admin ? [{ email: admin.email }] : [],
+  });
+}
+
+async function createOrderFixture() {
+  const user = await DB.addUser(createUser());
+  const franchise = await createFranchise();
+  const store = await DB.createStore(franchise.id, { name: `test-store-${uniqueValue()}` });
+  const menuItem = await DB.addMenuItem(createMenuItem());
+
+  return { user, franchise, store, menuItem };
+}
+
+async function cleanUpOrderFixture(fixture, orderId) {
+  if (orderId) {
+    await cleanUpOrder(orderId);
+  }
+  await cleanUpMenuItem(fixture.menuItem.id);
+  await cleanUpFranchise(fixture.franchise.id);
+  await cleanUpUser(fixture.user.id);
+}
+
 test('add a menu item to the database', async () => {
   const menuItem = createMenuItem();
   const createdItem = await DB.addMenuItem(menuItem);
@@ -187,4 +227,236 @@ test('log a user out', async () => {
   } finally {
     await cleanUpUser(createdUser.id);
   }
+});
+
+describe('order methods', () => {
+  test('add a diner order to the database', async () => {
+    const fixture = await createOrderFixture();
+    const order = {
+      franchiseId: fixture.franchise.id,
+      storeId: fixture.store.id,
+      items: [
+        {
+          menuId: fixture.menuItem.id,
+          description: fixture.menuItem.description,
+          price: fixture.menuItem.price,
+        },
+      ],
+    };
+    let createdOrder;
+
+    try {
+      createdOrder = await DB.addDinerOrder(fixture.user, order);
+
+      expect(createdOrder).toEqual({ ...order, id: expect.any(Number) });
+
+      const storedOrders = await withConnection((connection) =>
+        DB.query(connection, 'SELECT id, dinerId, franchiseId, storeId FROM dinerOrder WHERE id=?', [createdOrder.id])
+      );
+      expect(storedOrders).toEqual([
+        {
+          id: createdOrder.id,
+          dinerId: fixture.user.id,
+          franchiseId: fixture.franchise.id,
+          storeId: fixture.store.id,
+        },
+      ]);
+
+      const storedItems = await withConnection((connection) =>
+        DB.query(connection, 'SELECT orderId, menuId, description, price FROM orderItem WHERE orderId=?', [createdOrder.id])
+      );
+      expect(storedItems).toEqual([{ orderId: createdOrder.id, ...order.items[0] }]);
+    } finally {
+      await cleanUpOrderFixture(fixture, createdOrder?.id);
+    }
+  });
+
+  test('retrieve a diner order from the database', async () => {
+    const fixture = await createOrderFixture();
+    const order = {
+      franchiseId: fixture.franchise.id,
+      storeId: fixture.store.id,
+      items: [
+        {
+          menuId: fixture.menuItem.id,
+          description: fixture.menuItem.description,
+          price: fixture.menuItem.price,
+        },
+      ],
+    };
+    let createdOrder;
+
+    try {
+      createdOrder = await DB.addDinerOrder(fixture.user, order);
+      const result = await DB.getOrders(fixture.user);
+
+      expect(result).toEqual({
+        dinerId: fixture.user.id,
+        orders: [
+          {
+            id: createdOrder.id,
+            franchiseId: fixture.franchise.id,
+            storeId: fixture.store.id,
+            date: expect.any(Date),
+            items: [
+              {
+                id: expect.any(Number),
+                ...order.items[0],
+              },
+            ],
+          },
+        ],
+        page: 1,
+      });
+    } finally {
+      await cleanUpOrderFixture(fixture, createdOrder?.id);
+    }
+  });
+});
+
+describe('franchise methods', () => {
+  test('create a franchise in the database', async () => {
+    const admin = await DB.addUser(createUser());
+    let franchise;
+
+    try {
+      franchise = await createFranchise(admin);
+
+      expect(franchise).toEqual({
+        id: expect.any(Number),
+        name: expect.stringMatching(/^test-franchise-/),
+        admins: [{ id: admin.id, name: admin.name, email: admin.email }],
+      });
+
+      const storedFranchises = await withConnection((connection) => DB.query(connection, 'SELECT id, name FROM franchise WHERE id=?', [franchise.id]));
+      expect(storedFranchises).toEqual([{ id: franchise.id, name: franchise.name }]);
+
+      const storedRoles = await withConnection((connection) =>
+        DB.query(connection, 'SELECT userId, role, objectId FROM userRole WHERE userId=? AND objectId=?', [admin.id, franchise.id])
+      );
+      expect(storedRoles).toEqual([{ userId: admin.id, role: Role.Franchisee, objectId: franchise.id }]);
+    } finally {
+      if (franchise) {
+        await cleanUpFranchise(franchise.id);
+      }
+      await cleanUpUser(admin.id);
+    }
+  });
+
+  test('delete a franchise and its stores from the database', async () => {
+    const admin = await DB.addUser(createUser());
+    const franchise = await createFranchise(admin);
+    const store = await DB.createStore(franchise.id, { name: `test-store-${uniqueValue()}` });
+
+    try {
+      await expect(DB.deleteFranchise(franchise.id)).resolves.toBeUndefined();
+
+      const storedFranchises = await withConnection((connection) => DB.query(connection, 'SELECT id FROM franchise WHERE id=?', [franchise.id]));
+      const storedStores = await withConnection((connection) => DB.query(connection, 'SELECT id FROM store WHERE id=?', [store.id]));
+      const storedRoles = await withConnection((connection) =>
+        DB.query(connection, 'SELECT id FROM userRole WHERE objectId=? AND role=?', [franchise.id, Role.Franchisee])
+      );
+
+      expect(storedFranchises).toEqual([]);
+      expect(storedStores).toEqual([]);
+      expect(storedRoles).toEqual([]);
+    } finally {
+      await cleanUpFranchise(franchise.id);
+      await cleanUpUser(admin.id);
+    }
+  });
+
+  test('retrieve filtered franchises from the database', async () => {
+    const franchise = await createFranchise();
+    const store = await DB.createStore(franchise.id, { name: `test-store-${uniqueValue()}` });
+
+    try {
+      const [franchises, more] = await DB.getFranchises(undefined, 0, 10, franchise.name);
+
+      expect(franchises).toEqual([
+        {
+          id: franchise.id,
+          name: franchise.name,
+          stores: [{ id: store.id, name: store.name }],
+        },
+      ]);
+      expect(more).toBe(false);
+    } finally {
+      await cleanUpFranchise(franchise.id);
+    }
+  });
+
+  test('retrieve the franchises administered by a user', async () => {
+    const admin = await DB.addUser(createUser());
+    const franchise = await createFranchise(admin);
+    const store = await DB.createStore(franchise.id, { name: `test-store-${uniqueValue()}` });
+
+    try {
+      const franchises = await DB.getUserFranchises(admin.id);
+
+      expect(franchises).toEqual([
+        {
+          id: franchise.id,
+          name: franchise.name,
+          admins: [{ id: admin.id, name: admin.name, email: admin.email }],
+          stores: [{ id: store.id, name: store.name, totalRevenue: 0 }],
+        },
+      ]);
+    } finally {
+      await cleanUpFranchise(franchise.id);
+      await cleanUpUser(admin.id);
+    }
+  });
+
+  test('retrieve franchise details', async () => {
+    const admin = await DB.addUser(createUser());
+    const franchise = await createFranchise(admin);
+    const store = await DB.createStore(franchise.id, { name: `test-store-${uniqueValue()}` });
+
+    try {
+      const result = await DB.getFranchise({ id: franchise.id, name: franchise.name });
+
+      expect(result).toEqual({
+        id: franchise.id,
+        name: franchise.name,
+        admins: [{ id: admin.id, name: admin.name, email: admin.email }],
+        stores: [{ id: store.id, name: store.name, totalRevenue: 0 }],
+      });
+    } finally {
+      await cleanUpFranchise(franchise.id);
+      await cleanUpUser(admin.id);
+    }
+  });
+});
+
+describe('store methods', () => {
+  test('create a store in the database', async () => {
+    const franchise = await createFranchise();
+    const storeName = `test-store-${uniqueValue()}`;
+
+    try {
+      const store = await DB.createStore(franchise.id, { name: storeName });
+
+      expect(store).toEqual({ id: expect.any(Number), franchiseId: franchise.id, name: storeName });
+
+      const storedStores = await withConnection((connection) => DB.query(connection, 'SELECT id, franchiseId, name FROM store WHERE id=?', [store.id]));
+      expect(storedStores).toEqual([store]);
+    } finally {
+      await cleanUpFranchise(franchise.id);
+    }
+  });
+
+  test('delete a store from the database', async () => {
+    const franchise = await createFranchise();
+    const store = await DB.createStore(franchise.id, { name: `test-store-${uniqueValue()}` });
+
+    try {
+      await expect(DB.deleteStore(franchise.id, store.id)).resolves.toBeUndefined();
+
+      const storedStores = await withConnection((connection) => DB.query(connection, 'SELECT id FROM store WHERE id=?', [store.id]));
+      expect(storedStores).toEqual([]);
+    } finally {
+      await cleanUpFranchise(franchise.id);
+    }
+  });
 });
