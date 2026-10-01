@@ -1,326 +1,262 @@
+jest.mock('../database/database.js', () => ({
+  Role: {
+    Diner: 'diner',
+    Franchisee: 'franchisee',
+    Admin: 'admin',
+  },
+  DB: {
+    isLoggedIn: jest.fn(),
+    getFranchises: jest.fn(),
+    getUserFranchises: jest.fn(),
+    createFranchise: jest.fn(),
+    deleteFranchise: jest.fn(),
+    getFranchise: jest.fn(),
+    createStore: jest.fn(),
+    deleteStore: jest.fn(),
+  },
+}));
+
 const request = require('supertest');
-const app = require('../service');
-const { DB } = require('../database/database.js');
+const jwt = require('jsonwebtoken');
+const config = require('../config.js');
+const app = require('../service.js');
+const { DB, Role } = require('../database/database.js');
 
-const uniqueName = () => `${Date.now()}-${Math.random().toString(36).substring(2, 12)}`;
+const admin = {
+  id: 1,
+  name: 'Test Admin',
+  email: 'admin@test.com',
+  roles: [{ role: Role.Admin }],
+};
 
-let adminAuthToken;
-let franchiseAdmin;
-let franchiseAdminAuthToken;
-let nonAdminAuthToken;
-const createdFranchiseIds = new Set();
-const createdUserIds = new Set();
+const franchiseAdmin = {
+  id: 17,
+  name: 'Test Franchise Admin',
+  email: 'franchise-admin@test.com',
+  roles: [{ role: Role.Franchisee }],
+};
 
-async function registerUser(label) {
-  const uniqueId = uniqueName();
-  const registerRes = await request(app)
-    .post('/api/auth')
-    .send({
-      name: `${label}-${uniqueId}`,
-      email: `${label}-${uniqueId}@test.com`,
-      password: 'password',
-    });
+const diner = {
+  id: 18,
+  name: 'Test Diner',
+  email: 'diner@test.com',
+  roles: [{ role: Role.Diner }],
+};
 
-  if (registerRes.status !== 200) {
-    throw new Error(`Unable to register ${label}: ${registerRes.body.message}`);
-  }
-
-  createdUserIds.add(registerRes.body.user.id);
-  return registerRes.body;
-}
-
-async function createTestFranchise(franchiseAdministrator = franchiseAdmin) {
-  const createRes = await request(app)
-    .post('/api/franchise')
-    .set('Authorization', `Bearer ${adminAuthToken}`)
-    .send({
-      name: `test-franchise-${uniqueName()}`,
-      admins: [{ email: franchiseAdministrator.email }],
-    });
-
-  if (createRes.body.id) {
-    createdFranchiseIds.add(createRes.body.id);
-  }
-  expect(createRes.status).toBe(200);
-  return createRes.body;
-}
-
-async function cleanUpUsers() {
-  const userIds = [...createdUserIds];
-  if (userIds.length === 0) {
-    return;
-  }
-
-  const connection = await DB.getConnection();
-  try {
-    for (const userId of userIds) {
-      await DB.query(connection, 'DELETE FROM auth WHERE userId=?', [userId]);
-      await DB.query(connection, 'DELETE FROM userRole WHERE userId=?', [userId]);
-      await DB.query(connection, 'DELETE FROM user WHERE id=?', [userId]);
-    }
-  } finally {
-    await connection.end();
-  }
-}
-
-beforeAll(async () => {
-  const adminLoginRes = await request(app).put('/api/auth').send({
-    email: 'a@jwt.com',
-    password: 'admin',
-  });
-
-  if (adminLoginRes.status !== 200) {
-    throw new Error(`Unable to log in the test administrator: ${adminLoginRes.body.message}`);
-  }
-  adminAuthToken = adminLoginRes.body.token;
-
-  const registeredFranchiseAdmin = await registerUser('franchise-admin');
-  franchiseAdmin = registeredFranchiseAdmin.user;
-  franchiseAdminAuthToken = registeredFranchiseAdmin.token;
-
-  const registeredNonAdmin = await registerUser('non-admin');
-  nonAdminAuthToken = registeredNonAdmin.token;
-});
-
-afterEach(async () => {
-  for (const franchiseId of createdFranchiseIds) {
-    await DB.deleteFranchise(franchiseId);
-  }
-  createdFranchiseIds.clear();
-});
-
-afterAll(async () => {
-  await cleanUpUsers();
-});
-
-test('an admin can create a franchise', async () => {
-  const franchiseName = `test-franchise-${uniqueName()}`;
-
-  const createRes = await request(app)
-    .post('/api/franchise')
-    .set('Authorization', `Bearer ${adminAuthToken}`)
-    .send({
-      name: franchiseName,
-      admins: [{ email: franchiseAdmin.email }],
-    });
-
-  if (createRes.body.id) {
-    createdFranchiseIds.add(createRes.body.id);
-  }
-
-  expect(createRes.status).toBe(200);
-  expect(createRes.body).toEqual({
-    id: expect.any(Number),
-    name: franchiseName,
-    admins: [
-      {
-        id: franchiseAdmin.id,
-        name: franchiseAdmin.name,
-        email: franchiseAdmin.email,
-      },
-    ],
-  });
-});
-
-test('a non-admin cannot create a franchise', async () => {
-  const createRes = await request(app)
-    .post('/api/franchise')
-    .set('Authorization', `Bearer ${nonAdminAuthToken}`)
-    .send({
-      name: `test-franchise-${uniqueName()}`,
-      admins: [{ email: franchiseAdmin.email }],
-    });
-
-  expect(createRes.status).toBe(403);
-  expect(createRes.body).toMatchObject({
-    message: 'unable to create a franchise',
-  });
-});
-
-test('list franchises using the pagination and name filters', async () => {
-  const franchise = await createTestFranchise();
-  const store = await DB.createStore(franchise.id, { name: `test-store-${uniqueName()}` });
-
-  const listRes = await request(app)
-    .get('/api/franchise')
-    .query({ page: 0, limit: 10, name: franchise.name });
-
-  expect(listRes.status).toBe(200);
-  expect(listRes.body).toEqual({
-    franchises: [
-      {
-        id: franchise.id,
-        name: franchise.name,
-        stores: [{ id: store.id, name: store.name }],
-      },
-    ],
-    more: false,
-  });
-});
-
-test('a user can list the franchises they administer', async () => {
-  const franchise = await createTestFranchise();
-  const store = await DB.createStore(franchise.id, { name: `test-store-${uniqueName()}` });
-
-  const listRes = await request(app)
-    .get(`/api/franchise/${franchiseAdmin.id}`)
-    .set('Authorization', `Bearer ${franchiseAdminAuthToken}`);
-
-  expect(listRes.status).toBe(200);
-  expect(listRes.body).toEqual([
+const franchise = {
+  id: 4,
+  name: 'Test Franchise',
+  admins: [
     {
+      id: franchiseAdmin.id,
+      name: franchiseAdmin.name,
+      email: franchiseAdmin.email,
+    },
+  ],
+};
+
+const store = {
+  id: 9,
+  franchiseId: franchise.id,
+  name: 'Test Store',
+};
+
+function tokenFor(user) {
+  return jwt.sign(user, config.jwtSecret);
+}
+
+function authenticated(requestBuilder, user) {
+  return requestBuilder.set('Authorization', `Bearer ${tokenFor(user)}`);
+}
+
+beforeEach(() => {
+  jest.clearAllMocks();
+  DB.isLoggedIn.mockResolvedValue(true);
+});
+
+describe('POST /api/franchise', () => {
+  const franchiseRequest = {
+    name: franchise.name,
+    admins: [{ email: franchiseAdmin.email }],
+  };
+
+  test('an admin can create a franchise', async () => {
+    DB.createFranchise.mockResolvedValue(franchise);
+
+    const response = await authenticated(request(app).post('/api/franchise'), admin).send(franchiseRequest);
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual(franchise);
+    expect(DB.createFranchise).toHaveBeenCalledWith(franchiseRequest);
+  });
+
+  test('a non-admin cannot create a franchise', async () => {
+    const response = await authenticated(request(app).post('/api/franchise'), diner).send(franchiseRequest);
+
+    expect(response.status).toBe(403);
+    expect(response.body).toMatchObject({
+      message: 'unable to create a franchise',
+    });
+    expect(DB.createFranchise).not.toHaveBeenCalled();
+  });
+});
+
+describe('GET /api/franchise', () => {
+  test('lists franchises using the pagination and name filters', async () => {
+    const listedFranchise = {
       id: franchise.id,
       name: franchise.name,
-      admins: [
-        {
-          id: franchiseAdmin.id,
-          name: franchiseAdmin.name,
-          email: franchiseAdmin.email,
-        },
-      ],
+      stores: [{ id: store.id, name: store.name }],
+    };
+    DB.getFranchises.mockResolvedValue([[listedFranchise], false]);
+
+    const response = await request(app).get('/api/franchise').query({
+      page: 0,
+      limit: 10,
+      name: franchise.name,
+    });
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({
+      franchises: [listedFranchise],
+      more: false,
+    });
+    expect(DB.getFranchises).toHaveBeenCalledWith(undefined, '0', '10', franchise.name);
+  });
+});
+
+describe('GET /api/franchise/:userId', () => {
+  const userFranchises = [
+    {
+      ...franchise,
       stores: [{ id: store.id, name: store.name, totalRevenue: 0 }],
     },
-  ]);
-});
+  ];
 
-test("an admin can list another user's franchises", async () => {
-  const franchise = await createTestFranchise();
+  test('a user can list the franchises they administer', async () => {
+    DB.getUserFranchises.mockResolvedValue(userFranchises);
 
-  const listRes = await request(app)
-    .get(`/api/franchise/${franchiseAdmin.id}`)
-    .set('Authorization', `Bearer ${adminAuthToken}`);
+    const response = await authenticated(request(app).get(`/api/franchise/${franchiseAdmin.id}`), franchiseAdmin);
 
-  expect(listRes.status).toBe(200);
-  expect(listRes.body).toEqual([
-    expect.objectContaining({
-      id: franchise.id,
-      name: franchise.name,
-    }),
-  ]);
-});
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual(userFranchises);
+    expect(DB.getUserFranchises).toHaveBeenCalledWith(franchiseAdmin.id);
+  });
 
-test("a non-admin cannot list another user's franchises", async () => {
-  await createTestFranchise();
+  test("an admin can list another user's franchises", async () => {
+    DB.getUserFranchises.mockResolvedValue(userFranchises);
 
-  const listRes = await request(app)
-    .get(`/api/franchise/${franchiseAdmin.id}`)
-    .set('Authorization', `Bearer ${nonAdminAuthToken}`);
+    const response = await authenticated(request(app).get(`/api/franchise/${franchiseAdmin.id}`), admin);
 
-  expect(listRes.status).toBe(200);
-  expect(listRes.body).toEqual([]);
-});
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual(userFranchises);
+    expect(DB.getUserFranchises).toHaveBeenCalledWith(franchiseAdmin.id);
+  });
 
-test("listing a user's franchises requires authentication", async () => {
-  const listRes = await request(app).get(`/api/franchise/${franchiseAdmin.id}`);
+  test("a non-admin cannot list another user's franchises", async () => {
+    const response = await authenticated(request(app).get(`/api/franchise/${franchiseAdmin.id}`), diner);
 
-  expect(listRes.status).toBe(401);
-  expect(listRes.body).toEqual({ message: 'unauthorized' });
-});
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual([]);
+    expect(DB.getUserFranchises).not.toHaveBeenCalled();
+  });
 
-test('delete a franchise', async () => {
-  const franchise = await createTestFranchise();
+  test("listing a user's franchises requires authentication", async () => {
+    const response = await request(app).get(`/api/franchise/${franchiseAdmin.id}`);
 
-  const deleteRes = await request(app)
-    .delete(`/api/franchise/${franchise.id}`)
-    .set('Authorization', `Bearer ${adminAuthToken}`);
-
-  expect(deleteRes.status).toBe(200);
-  expect(deleteRes.body).toEqual({ message: 'franchise deleted' });
-
-  const listRes = await request(app)
-    .get('/api/franchise')
-    .query({ page: 0, limit: 10, name: franchise.name });
-  expect(listRes.body.franchises).toEqual([]);
-});
-
-test('a franchise administrator can create a store', async () => {
-  const franchise = await createTestFranchise();
-  const storeName = `test-store-${uniqueName()}`;
-
-  const createRes = await request(app)
-    .post(`/api/franchise/${franchise.id}/store`)
-    .set('Authorization', `Bearer ${franchiseAdminAuthToken}`)
-    .send({ name: storeName });
-
-  expect(createRes.status).toBe(200);
-  expect(createRes.body).toEqual({
-    id: expect.any(Number),
-    franchiseId: franchise.id,
-    name: storeName,
+    expect(response.status).toBe(401);
+    expect(response.body).toEqual({ message: 'unauthorized' });
+    expect(DB.getUserFranchises).not.toHaveBeenCalled();
   });
 });
 
-test('an admin can create a store', async () => {
-  const franchise = await createTestFranchise();
-  const storeName = `test-store-${uniqueName()}`;
+describe('DELETE /api/franchise/:franchiseId', () => {
+  test('deletes a franchise', async () => {
+    DB.deleteFranchise.mockResolvedValue();
 
-  const createRes = await request(app)
-    .post(`/api/franchise/${franchise.id}/store`)
-    .set('Authorization', `Bearer ${adminAuthToken}`)
-    .send({ name: storeName });
+    const response = await authenticated(request(app).delete(`/api/franchise/${franchise.id}`), admin);
 
-  expect(createRes.status).toBe(200);
-  expect(createRes.body).toMatchObject({
-    franchiseId: franchise.id,
-    name: storeName,
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ message: 'franchise deleted' });
+    expect(DB.deleteFranchise).toHaveBeenCalledWith(franchise.id);
   });
 });
 
-test('an unrelated user cannot create a store', async () => {
-  const franchise = await createTestFranchise();
+describe('POST /api/franchise/:franchiseId/store', () => {
+  test('a franchise administrator can create a store', async () => {
+    DB.getFranchise.mockResolvedValue(franchise);
+    DB.createStore.mockResolvedValue(store);
 
-  const createRes = await request(app)
-    .post(`/api/franchise/${franchise.id}/store`)
-    .set('Authorization', `Bearer ${nonAdminAuthToken}`)
-    .send({ name: `test-store-${uniqueName()}` });
+    const response = await authenticated(request(app).post(`/api/franchise/${franchise.id}/store`), franchiseAdmin).send({ name: store.name });
 
-  expect(createRes.status).toBe(403);
-  expect(createRes.body).toMatchObject({
-    message: 'unable to create a store',
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual(store);
+    expect(DB.getFranchise).toHaveBeenCalledWith({ id: franchise.id });
+    expect(DB.createStore).toHaveBeenCalledWith(franchise.id, { name: store.name });
+  });
+
+  test('an admin can create a store', async () => {
+    DB.getFranchise.mockResolvedValue(franchise);
+    DB.createStore.mockResolvedValue(store);
+
+    const response = await authenticated(request(app).post(`/api/franchise/${franchise.id}/store`), admin).send({ name: store.name });
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual(store);
+    expect(DB.getFranchise).toHaveBeenCalledWith({ id: franchise.id });
+    expect(DB.createStore).toHaveBeenCalledWith(franchise.id, { name: store.name });
+  });
+
+  test('an unrelated user cannot create a store', async () => {
+    DB.getFranchise.mockResolvedValue(franchise);
+
+    const response = await authenticated(request(app).post(`/api/franchise/${franchise.id}/store`), diner).send({ name: store.name });
+
+    expect(response.status).toBe(403);
+    expect(response.body).toMatchObject({
+      message: 'unable to create a store',
+    });
+    expect(DB.getFranchise).toHaveBeenCalledWith({ id: franchise.id });
+    expect(DB.createStore).not.toHaveBeenCalled();
   });
 });
 
-test('a franchise administrator can delete a store', async () => {
-  const franchise = await createTestFranchise();
-  const store = await DB.createStore(franchise.id, { name: `test-store-${uniqueName()}` });
+describe('DELETE /api/franchise/:franchiseId/store/:storeId', () => {
+  test('a franchise administrator can delete a store', async () => {
+    DB.getFranchise.mockResolvedValue(franchise);
+    DB.deleteStore.mockResolvedValue();
 
-  const deleteRes = await request(app)
-    .delete(`/api/franchise/${franchise.id}/store/${store.id}`)
-    .set('Authorization', `Bearer ${franchiseAdminAuthToken}`);
+    const response = await authenticated(request(app).delete(`/api/franchise/${franchise.id}/store/${store.id}`), franchiseAdmin);
 
-  expect(deleteRes.status).toBe(200);
-  expect(deleteRes.body).toEqual({ message: 'store deleted' });
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ message: 'store deleted' });
+    expect(DB.getFranchise).toHaveBeenCalledWith({ id: franchise.id });
+    expect(DB.deleteStore).toHaveBeenCalledWith(franchise.id, store.id);
+  });
 
-  const listRes = await request(app)
-    .get('/api/franchise')
-    .query({ page: 0, limit: 10, name: franchise.name });
-  expect(listRes.body.franchises[0].stores).toEqual([]);
-});
+  test('an unrelated user cannot delete a store', async () => {
+    DB.getFranchise.mockResolvedValue(franchise);
 
-test('an unrelated user cannot delete a store', async () => {
-  const franchise = await createTestFranchise();
-  const store = await DB.createStore(franchise.id, { name: `test-store-${uniqueName()}` });
+    const response = await authenticated(request(app).delete(`/api/franchise/${franchise.id}/store/${store.id}`), diner);
 
-  const deleteRes = await request(app)
-    .delete(`/api/franchise/${franchise.id}/store/${store.id}`)
-    .set('Authorization', `Bearer ${nonAdminAuthToken}`);
-
-  expect(deleteRes.status).toBe(403);
-  expect(deleteRes.body).toMatchObject({
-    message: 'unable to delete a store',
+    expect(response.status).toBe(403);
+    expect(response.body).toMatchObject({
+      message: 'unable to delete a store',
+    });
+    expect(DB.getFranchise).toHaveBeenCalledWith({ id: franchise.id });
+    expect(DB.deleteStore).not.toHaveBeenCalled();
   });
 });
 
 test.each([
-  ['creating', 'post'],
-  ['deleting', 'delete'],
-])('%s a store requires authentication', async (operation, method) => {
-  const franchise = await createTestFranchise();
-  const store = await DB.createStore(franchise.id, { name: `test-store-${uniqueName()}` });
-  const path = method === 'post' ? `/api/franchise/${franchise.id}/store` : `/api/franchise/${franchise.id}/store/${store.id}`;
+  ['creating', 'post', `/api/franchise/${franchise.id}/store`],
+  ['deleting', 'delete', `/api/franchise/${franchise.id}/store/${store.id}`],
+])('%s a store requires authentication', async (operation, method, path) => {
+  const response = await request(app)[method](path).send({ name: store.name });
 
-  const storeRes = await request(app)[method](path).send({ name: `test-store-${uniqueName()}` });
-
-  expect(storeRes.status).toBe(401);
-  expect(storeRes.body).toEqual({ message: 'unauthorized' });
+  expect(response.status).toBe(401);
+  expect(response.body).toEqual({ message: 'unauthorized' });
+  expect(DB.getFranchise).not.toHaveBeenCalled();
+  expect(DB.createStore).not.toHaveBeenCalled();
+  expect(DB.deleteStore).not.toHaveBeenCalled();
 });
